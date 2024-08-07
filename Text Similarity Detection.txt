@@ -1,0 +1,153 @@
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+from torch.optim import Adam
+from torch.nn import BCEWithLogitsLoss
+from tqdm import tqdm
+
+# Load the dataset
+data_file_path = '/content/drive/MyDrive/text_similarity_pairs.csv'
+pairs_df = pd.read_csv(data_file_path)
+pairs_df.drop(columns=['Unnamed: 0'], inplace=True)
+
+# Check for non-string inputs and convert labels to numeric
+def check_and_convert_to_string(text):
+    if not isinstance(text, str):
+        return str(text)
+    return text
+
+pairs_df['text1'] = pairs_df['text1'].apply(check_and_convert_to_string)
+pairs_df['text2'] = pairs_df['text2'].apply(check_and_convert_to_string)
+pairs_df['label'] = pd.to_numeric(pairs_df['label'], errors='coerce')
+
+# Ensure no NaN values in labels after conversion
+pairs_df = pairs_df.dropna(subset=['label'])
+
+# Convert labels to integer
+pairs_df['label'] = pairs_df['label'].astype(int)
+
+# Initialize the tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+class TextPairsDataset(Dataset):
+    def _init_(self, pairs_df, tokenizer, max_len=128):
+        self.pairs_df = pairs_df
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def _len_(self):
+        return len(self.pairs_df)
+
+    def _getitem_(self, idx):
+        text1 = self.pairs_df.iloc[idx, 0]
+        text2 = self.pairs_df.iloc[idx, 1]
+        label = self.pairs_df.iloc[idx, 2]
+
+        # Ensure text1 and text2 are strings
+        text1 = check_and_convert_to_string(text1)
+        text2 = check_and_convert_to_string(text2)
+
+        # Tokenize and encode the first text
+        encoding1 = self.tokenizer.encode_plus(
+            text1,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+        # Tokenize and encode the second text
+        encoding2 = self.tokenizer.encode_plus(
+            text2,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+        return {
+            'text1_input_ids': encoding1['input_ids'].flatten(),
+            'text1_attention_mask': encoding1['attention_mask'].flatten(),
+            'text2_input_ids': encoding2['input_ids'].flatten(),
+            'text2_attention_mask': encoding2['attention_mask'].flatten(),
+            'label': torch.tensor(label, dtype=torch.float)
+        }
+
+# Create the dataset and dataloader
+dataset = TextPairsDataset(pairs_df, tokenizer)
+dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+# Define the model
+class SiameseNetworkLSTM(nn.Module):
+    def _init_(self):
+        super(SiameseNetworkLSTM, self)._init_()
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.lstm = nn.LSTM(input_size=768, hidden_size=128, num_layers=1, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(128 * 2, 1)
+
+    def forward(self, input_ids1, attention_mask1, input_ids2, attention_mask2):
+        # Get the representations from BERT for the first text
+        output1 = self.bert(input_ids1, attention_mask=attention_mask1).last_hidden_state
+        # Get the representations from BERT for the second text
+        output2 = self.bert(input_ids2, attention_mask=attention_mask2).last_hidden_state
+
+        # Pass the representations through LSTM
+        lstm_out1, _ = self.lstm(output1)
+        lstm_out2, _ = self.lstm(output2)
+
+        # Get the output of the last LSTM cell
+        lstm_out1 = lstm_out1[:, -1, :]
+        lstm_out2 = lstm_out2[:, -1, :]
+
+        # Calculate the absolute difference between the two representations
+        distance = torch.abs(lstm_out1 - lstm_out2)
+        # Pass the difference through a fully connected layer to get the similarity score
+        output = self.fc(distance)
+        return output
+
+# Initialize the model, optimizer, and loss function
+model = SiameseNetworkLSTM()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+epochs = 50
+optimizer = Adam(model.parameters(), lr=2e-5)
+criterion = BCEWithLogitsLoss()
+
+# Define the training loop
+def train(model, dataloader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(dataloader, desc="Training"):
+        optimizer.zero_grad()
+        input_ids1 = batch['text1_input_ids'].to(device)
+        attention_mask1 = batch['text1_attention_mask'].to(device)
+        input_ids2 = batch['text2_input_ids'].to(device)
+        attention_mask2 = batch['text2_attention_mask'].to(device)
+        labels = batch['label'].to(device)
+
+        # Forward pass
+        outputs = model(input_ids1, attention_mask1, input_ids2, attention_mask2)
+        # Compute the loss
+        loss = criterion(outputs.view(-1), labels)
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+# Train the model
+for epoch in range(epochs):
+    avg_loss = train(model, dataloader, optimizer, criterion, device)
+    print(f'Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}')
+
+# Save the model
+torch.save(model.state_dict(), '/content/drive/MyDrive/similarity_model.pth')
